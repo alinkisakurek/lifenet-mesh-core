@@ -10,6 +10,11 @@ void sf_init() {
 }
 
 bool sf_enqueue(const Packet& p, uint32_t now_ms) {
+#if DEBUG_ENABLED
+    DBG_PRINTF("[SF] enqueue request dst=0x%04X msg_id=%08X at %u ms\n",
+               p.dst_addr, (unsigned int)p.msg_id, now_ms);
+#endif
+
     int target_idx = -1;
     int oldest_idx = -1;
     uint32_t max_age = 0; // Used to track max age
@@ -20,11 +25,11 @@ bool sf_enqueue(const Packet& p, uint32_t now_ms) {
             target_idx = i;
             break; // Found a free slot, no need to evict
         } else {
-            // Age is calculated using unsigned subtraction which naturally 
+            // Age is calculated using unsigned subtraction which naturally
             // handles the millis() overflow safely for diffs < 49 days.
             uint32_t age = now_ms - queue[i].enqueue_time;
             if (oldest_idx == -1 || age > max_age) {
-                max_age = age;
+                max_age   = age;
                 oldest_idx = i;
             }
         }
@@ -33,17 +38,28 @@ bool sf_enqueue(const Packet& p, uint32_t now_ms) {
     if (target_idx == -1) {
         // Queue is completely full. We must drop the oldest entry (strict FIFO).
         if (oldest_idx != -1) {
+#if DEBUG_ENABLED
+            DBG_PRINTF("[SF] queue full, evicting oldest idx=%d (age=%u ms)\n",
+                       oldest_idx, max_age);
+#endif
             target_idx = oldest_idx;
         } else {
             // Should theoretically never happen if QUEUE_MAX_MESSAGES > 0
+#if DEBUG_ENABLED
+            DBG_PRINTLN("[SF] enqueue failed: no slot and no oldest_idx (BUG)");
+#endif
             return false;
         }
     }
 
-    queue[target_idx].packet = p;
+#if DEBUG_ENABLED
+    DBG_PRINTF("[SF] storing at idx=%d\n", target_idx);
+#endif
+
+    queue[target_idx].packet       = p;
     queue[target_idx].enqueue_time = now_ms;
-    queue[target_idx].retry_count = 0;
-    queue[target_idx].in_use = true;
+    queue[target_idx].retry_count  = 0;
+    queue[target_idx].in_use       = true;
 
     return true; // We successfully queued it (even if we dropped an older one)
 }
@@ -64,13 +80,13 @@ void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
     // Simple bubble sort to order active_indices by age (descending)
     for (int i = 0; i < active_count - 1; ++i) {
         for (int j = 0; j < active_count - i - 1; ++j) {
-            uint32_t age_j = now_ms - queue[active_indices[j]].enqueue_time;
+            uint32_t age_j    = now_ms - queue[active_indices[j]].enqueue_time;
             uint32_t age_next = now_ms - queue[active_indices[j + 1]].enqueue_time;
-            
+
             if (age_j < age_next) {
                 // Next is older, swap so oldest moves to the front
-                int temp = active_indices[j];
-                active_indices[j] = active_indices[j + 1];
+                int temp              = active_indices[j];
+                active_indices[j]     = active_indices[j + 1];
                 active_indices[j + 1] = temp;
             }
         }
@@ -83,18 +99,37 @@ void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
 
         // Check for absolute expiration
         if ((int32_t)(now_ms - queue[i].enqueue_time) >= QUEUE_MAX_AGE_MS) {
+#if DEBUG_ENABLED
+            DBG_PRINTF("[SF] dropping idx=%d due to age >= %u ms\n",
+                       i, QUEUE_MAX_AGE_MS);
+#endif
             queue[i].in_use = false;
             continue;
         }
 
+#if DEBUG_ENABLED
+        DBG_PRINTF("[SF] retry idx=%d dst=0x%04X msg_id=%08X retries=%u\n",
+                   i,
+                   queue[i].packet.dst_addr,
+                   (unsigned int)queue[i].packet.msg_id,
+                   (unsigned int)queue[i].retry_count);
+#endif
+
         // Attempt forwarding via the callback
         if (send_fn(queue[i].packet)) {
             // Forwarding succeeded (e.g. got ACK)
+#if DEBUG_ENABLED
+            DBG_PRINTF("[SF] success, removing idx=%d\n", i);
+#endif
             queue[i].in_use = false;
         } else {
             // Forwarding failed
             queue[i].retry_count++;
             if (queue[i].retry_count > QUEUE_MAX_RETRIES) {
+#if DEBUG_ENABLED
+                DBG_PRINTF("[SF] dropping idx=%d after %u retries\n",
+                           i, (unsigned int)queue[i].retry_count);
+#endif
                 // Exceeded max retries, drop message
                 queue[i].in_use = false;
             }
@@ -109,7 +144,11 @@ void sf_debug_dump(uint32_t now_ms) {
         if (queue[i].in_use) {
             uint32_t age_ms = now_ms - queue[i].enqueue_time;
             DBG_PRINTF("idx: %d | dst: 0x%04X | msg_id: %u | retries: %d | age: %u ms\n",
-                       i, queue[i].packet.dst_addr, queue[i].packet.msg_id, queue[i].retry_count, age_ms);
+                       i,
+                       queue[i].packet.dst_addr,
+                       queue[i].packet.msg_id,
+                       queue[i].retry_count,
+                       age_ms);
         }
     }
 #endif

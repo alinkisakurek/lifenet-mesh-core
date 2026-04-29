@@ -2,76 +2,134 @@
 #include "lora_link.h"
 #include "routing.h"
 #include "store_forward.h"
+#include "debug.h"
 #include <Arduino.h>
 
 #define ACK_TIMEOUT_MS 2000
 #define MAX_TX_RETRIES 3
 
 #define PACKET_TYPE_DATA 0
-#define PACKET_TYPE_ACK 6
+#define PACKET_TYPE_ACK  6
 
-bool mesh_send_unicast(Packet& p, uint16_t local_addr, uint32_t now_ms) {
+static bool mesh_send_unicast_internal(Packet& p, uint16_t local_addr, uint32_t now_ms, bool allow_enqueue) {
     RouteEntry route;
+
+    DBG_PRINTF("[MESH_TX] dst=0x%04X msg_id=%08X now=%u allow_enqueue=%d\n",
+               p.dst_addr, (unsigned int)p.msg_id, now_ms, (int)allow_enqueue);
+
     if (!routing_lookup(p.dst_addr, route, now_ms)) {
-        sf_enqueue(p, now_ms);
-        return false; // No route exists
+        DBG_PRINTLN("[MESH_TX] no valid route, considering enqueue");
+
+        if (allow_enqueue) {
+            bool qok = sf_enqueue(p, now_ms);
+            DBG_PRINTF("[MESH_TX] sf_enqueue (no route) result=%d\n", (int)qok);
+        }
+        return false;
     }
+
+    DBG_PRINTF("[MESH_TX] route lookup -> next=0x%04X hop=%u state=%d\n",
+               route.next_hop, route.hop_count, (int)route.state);
 
     p.prev_hop = local_addr;
     p.next_hop = route.next_hop;
 
-    for (int attempt = 0; attempt <= MAX_TX_RETRIES; ++attempt) {
+    for (int attempt = 0; attempt < MAX_TX_RETRIES; ++attempt) {
+        DBG_PRINTF("[MESH_TX] attempt %d to next=0x%04X\n", attempt + 1, route.next_hop);
+
         if (!lora_send_packet(p)) {
-            continue; // Hardware/UART send failed locally, try again
+            DBG_PRINTLN("[MESH_TX] lora_send_packet failed locally, retrying");
+            continue;
         }
 
-        // Wait for an ACK
         Packet rx;
         if (lora_receive_packet(rx, ACK_TIMEOUT_MS)) {
-            // Validate the ACK
+            DBG_PRINTF("[MESH_TX] got packet while waiting for ACK: type=%d src=0x%04X dst=0x%04X msg_id=%08X\n",
+                       rx.type, rx.src_addr, rx.dst_addr, (unsigned int)rx.msg_id);
+
             if (rx.type == PACKET_TYPE_ACK &&
                 rx.msg_id == p.msg_id &&
                 rx.src_addr == route.next_hop &&
                 rx.dst_addr == local_addr) {
-                return true; // Successfully forwarded!
+                DBG_PRINTLN("[MESH_TX] ACK matched, send success");
+                return true;
+            } else {
+                DBG_PRINTLN("[MESH_TX] received packet is not our ACK, handing to mesh_handle_incoming");
+                mesh_handle_incoming(rx, local_addr, millis());
             }
+        } else {
+            DBG_PRINTLN("[MESH_TX] ACK timeout expired");
         }
-        // If lora_receive_packet times out, or the received packet wasn't our ACK,
-        // the loop continues and we retry the transmission.
     }
 
-    // All retries failed
+    DBG_PRINTLN("[MESH_TX] all retries failed, invalidating route and considering enqueue");
     routing_invalidate(p.dst_addr);
-    sf_enqueue(p, now_ms); // Best-effort enqueue for later
-    
+
+    if (allow_enqueue) {
+        bool qok = sf_enqueue(p, now_ms);
+        DBG_PRINTF("[MESH_TX] sf_enqueue (after retries) result=%d\n", (int)qok);
+    }
+
     return false;
 }
 
+bool mesh_send_unicast(Packet& p, uint16_t local_addr, uint32_t now_ms) {
+    return mesh_send_unicast_internal(p, local_addr, now_ms, true);
+}
+
+bool mesh_retry_queued_packet(Packet& p, uint16_t local_addr, uint32_t now_ms) {
+    return mesh_send_unicast_internal(p, local_addr, now_ms, false);
+}
+
 bool mesh_handle_incoming(Packet& p, uint16_t local_addr, uint32_t now_ms) {
-    if (p.dst_addr == local_addr) {
-        if (p.type == PACKET_TYPE_DATA) {
-            // Generate and send an ACK back to the prev_hop that sent this to us
-            Packet ack;
-            packet_init(ack);
-            ack.msg_id = p.msg_id;
-            ack.src_addr = local_addr;
-            ack.dst_addr = p.prev_hop;
-            ack.prev_hop = local_addr;
-            ack.next_hop = p.prev_hop;
-            ack.type = PACKET_TYPE_ACK;
-            ack.ttl = 1;
-            ack.hop_count = 0;
-            ack.payload_len = 0;
-            
-            lora_send_packet(ack);
-            return true;
-        } else if (p.type == PACKET_TYPE_ACK) {
-            // Consume the ACK if it wasn't intercepted by a waiting mesh_send_unicast
-            // (e.g. if it arrived slightly after timeout).
-            return true;
+    if (p.type == PACKET_TYPE_DATA) {
+        if (dupdet_is_duplicate(p.msg_id, p.src_addr)) {
+            DBG_PRINTF("[MESH_RX] duplicate DATA dropped src=0x%04X msg_id=%08X\n",
+                       p.src_addr, (unsigned int)p.msg_id);
+            return false;
         }
     }
-    
-    // Not addressed to us, or routing/forwarding integration will come later.
+
+    if (p.dst_addr == local_addr) {
+        if (p.type == PACKET_TYPE_DATA) {
+            Packet ack;
+            packet_init(ack);
+            ack.msg_id      = p.msg_id;
+            ack.src_addr    = local_addr;
+            ack.dst_addr    = p.prev_hop;
+            ack.prev_hop    = local_addr;
+            ack.next_hop    = p.prev_hop;
+            ack.type        = PACKET_TYPE_ACK;
+            ack.ttl         = 1;
+            ack.hop_count   = 0;
+            ack.payload_len = 0;
+
+            DBG_PRINTF("[MESH_RX] DATA for us, sending ACK to 0x%04X\n", ack.dst_addr);
+            if (!lora_send_packet(ack)) {
+                DBG_PRINTLN("[MESH_RX] ACK send failed");
+            }
+            return true;
+        } else if (p.type == PACKET_TYPE_ACK) {
+            DBG_PRINTLN("[MESH_RX] stray ACK for us, consuming");
+            return true;
+        }
+    } else if (p.type == PACKET_TYPE_DATA) {
+        if (p.ttl <= 1) {
+            DBG_PRINTLN("[MESH_FWD] dropping DATA due to TTL<=1");
+            return false;
+        }
+
+        p.ttl      -= 1;
+        p.hop_count += 1;
+
+        RouteEntry route;
+        if (!routing_lookup(p.dst_addr, route, now_ms)) {
+            DBG_PRINTLN("[MESH_FWD] no route for transit DATA, not forwarding");
+            return false;
+        }
+
+        DBG_PRINTF("[MESH_FWD] forwarding transit DATA to next=0x%04X\n", route.next_hop);
+        return mesh_send_unicast(p, local_addr, now_ms);
+    }
+
     return false;
 }
