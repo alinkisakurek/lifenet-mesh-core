@@ -89,30 +89,32 @@ bool mesh_handle_incoming(Packet& p, uint16_t local_addr, uint32_t now_ms) {
         }
     }
 
-    if (p.dst_addr == local_addr) {
-        if (p.type == PACKET_TYPE_DATA) {
-            Packet ack;
-            packet_init(ack);
-            ack.msg_id      = p.msg_id;
-            ack.src_addr    = local_addr;
-            ack.dst_addr    = p.prev_hop;
-            ack.prev_hop    = local_addr;
-            ack.next_hop    = p.prev_hop;
-            ack.type        = PACKET_TYPE_ACK;
-            ack.ttl         = 1;
-            ack.hop_count   = 0;
-            ack.payload_len = 0;
+    // 1. ACK GÖNDERME: Hedef biz isek VEYA bir sonraki kurye biz isek ACK atmalıyız!
+    if (p.type == PACKET_TYPE_DATA && (p.dst_addr == local_addr || p.next_hop == local_addr)) {
+        Packet ack;
+        packet_init(ack);
+        ack.msg_id      = p.msg_id;
+        ack.src_addr    = local_addr;
+        ack.dst_addr    = p.prev_hop;
+        ack.prev_hop    = local_addr;
+        ack.next_hop    = p.prev_hop;
+        ack.type        = PACKET_TYPE_ACK;
+        ack.ttl         = 1;
+        ack.hop_count   = 0;
+        ack.payload_len = 0;
 
-            DBG_PRINTF("[MESH_RX] DATA for us, sending ACK to 0x%04X\n", ack.dst_addr);
-            if (!lora_send_packet(ack)) {
-                DBG_PRINTLN("[MESH_RX] ACK send failed");
-            }
-            return true;
-        } else if (p.type == PACKET_TYPE_ACK) {
-            DBG_PRINTLN("[MESH_RX] stray ACK for us, consuming");
+        DBG_PRINTF("[MESH_RX] DATA received, sending ACK to 0x%04X\n", ack.dst_addr);
+        lora_send_packet(ack);
+
+        // Eğer nihai hedef BİZ isek (Gateway), veriyi işledik demektir.
+        if (p.dst_addr == local_addr) {
+            DBG_PRINTLN("[MESH_RX] Packet arrived at FINAL DESTINATION!");
             return true;
         }
-    } else if (p.type == PACKET_TYPE_DATA) {
+    }
+
+    // 2. KURYELİK (FORWARDING): Hedef biz değilsek ama paket bize emanet edilmişse
+    if (p.type == PACKET_TYPE_DATA && p.dst_addr != local_addr && p.next_hop == local_addr) {
         if (p.ttl <= 1) {
             DBG_PRINTLN("[MESH_FWD] dropping DATA due to TTL<=1");
             return false;
@@ -129,6 +131,11 @@ bool mesh_handle_incoming(Packet& p, uint16_t local_addr, uint32_t now_ms) {
 
         DBG_PRINTF("[MESH_FWD] forwarding transit DATA to next=0x%04X\n", route.next_hop);
         return mesh_send_unicast(p, local_addr, now_ms);
+    }
+
+    if (p.type == PACKET_TYPE_ACK && p.dst_addr == local_addr) {
+        DBG_PRINTLN("[MESH_RX] stray ACK for us, consuming");
+        return true;
     }
 
     return false;

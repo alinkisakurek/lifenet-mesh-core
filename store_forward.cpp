@@ -17,16 +17,13 @@ bool sf_enqueue(const Packet& p, uint32_t now_ms) {
 
     int target_idx = -1;
     int oldest_idx = -1;
-    uint32_t max_age = 0; // Used to track max age
+    uint32_t max_age = 0; 
 
-    // Find a free slot, and simultaneously track the absolute oldest entry
     for (int i = 0; i < QUEUE_MAX_MESSAGES; ++i) {
         if (!queue[i].in_use) {
             target_idx = i;
-            break; // Found a free slot, no need to evict
+            break; 
         } else {
-            // Age is calculated using unsigned subtraction which naturally
-            // handles the millis() overflow safely for diffs < 49 days.
             uint32_t age = now_ms - queue[i].enqueue_time;
             if (oldest_idx == -1 || age > max_age) {
                 max_age   = age;
@@ -36,7 +33,6 @@ bool sf_enqueue(const Packet& p, uint32_t now_ms) {
     }
 
     if (target_idx == -1) {
-        // Queue is completely full. We must drop the oldest entry (strict FIFO).
         if (oldest_idx != -1) {
 #if DEBUG_ENABLED
             DBG_PRINTF("[SF] queue full, evicting oldest idx=%d (age=%u ms)\n",
@@ -44,7 +40,6 @@ bool sf_enqueue(const Packet& p, uint32_t now_ms) {
 #endif
             target_idx = oldest_idx;
         } else {
-            // Should theoretically never happen if QUEUE_MAX_MESSAGES > 0
 #if DEBUG_ENABLED
             DBG_PRINTLN("[SF] enqueue failed: no slot and no oldest_idx (BUG)");
 #endif
@@ -60,14 +55,14 @@ bool sf_enqueue(const Packet& p, uint32_t now_ms) {
     queue[target_idx].enqueue_time = now_ms;
     queue[target_idx].retry_count  = 0;
     queue[target_idx].in_use       = true;
+    queue[target_idx].last_attempt_time = 0; // Ilk eklendiginde sifirla
 
-    return true; // We successfully queued it (even if we dropped an older one)
+    return true; 
 }
 
 void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
     if (!send_fn) return;
 
-    // To process strictly in FIFO order (oldest first), we sort the active indices.
     int active_indices[QUEUE_MAX_MESSAGES];
     int active_count = 0;
 
@@ -77,14 +72,12 @@ void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
         }
     }
 
-    // Simple bubble sort to order active_indices by age (descending)
     for (int i = 0; i < active_count - 1; ++i) {
         for (int j = 0; j < active_count - i - 1; ++j) {
             uint32_t age_j    = now_ms - queue[active_indices[j]].enqueue_time;
             uint32_t age_next = now_ms - queue[active_indices[j + 1]].enqueue_time;
 
             if (age_j < age_next) {
-                // Next is older, swap so oldest moves to the front
                 int temp              = active_indices[j];
                 active_indices[j]     = active_indices[j + 1];
                 active_indices[j + 1] = temp;
@@ -92,12 +85,12 @@ void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
         }
     }
 
-    // Process from oldest to newest
+    // Sirasiyla isle (En eskiden en yeniye)
     for (int k = 0; k < active_count; ++k) {
         int i = active_indices[k];
-        if (!queue[i].in_use) continue; // Safety check
+        if (!queue[i].in_use) continue; 
 
-        // Check for absolute expiration
+        // Suresi tamamen dolmus mu kontrol et (Orn: 5 dk)
         if ((int32_t)(now_ms - queue[i].enqueue_time) >= QUEUE_MAX_AGE_MS) {
 #if DEBUG_ENABLED
             DBG_PRINTF("[SF] dropping idx=%d due to age >= %u ms\n",
@@ -107,6 +100,13 @@ void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
             continue;
         }
 
+        // --- HIZLI DENEME (RAPID-FIRE) ENGELLEYICI ---
+        if (queue[i].last_attempt_time != 0 && (now_ms - queue[i].last_attempt_time < 5000)) {
+            continue; // Son denemeden bu yana 5 saniye gecmediyse, bu mesaji pas gec
+        }
+        queue[i].last_attempt_time = now_ms; // Deneme zamanini guncelle
+        // ---------------------------------------------
+
 #if DEBUG_ENABLED
         DBG_PRINTF("[SF] retry idx=%d dst=0x%04X msg_id=%08X retries=%u\n",
                    i,
@@ -115,22 +115,20 @@ void sf_process(uint32_t now_ms, StoreForwardSendFn send_fn) {
                    (unsigned int)queue[i].retry_count);
 #endif
 
-        // Attempt forwarding via the callback
+        // Ağa gondermeyi dene (Sadece bir kere calisacak)
         if (send_fn(queue[i].packet)) {
-            // Forwarding succeeded (e.g. got ACK)
 #if DEBUG_ENABLED
             DBG_PRINTF("[SF] success, removing idx=%d\n", i);
 #endif
             queue[i].in_use = false;
         } else {
-            // Forwarding failed
+            // Basarisiz oldu, deneme sayisini artir
             queue[i].retry_count++;
             if (queue[i].retry_count > QUEUE_MAX_RETRIES) {
 #if DEBUG_ENABLED
                 DBG_PRINTF("[SF] dropping idx=%d after %u retries\n",
                            i, (unsigned int)queue[i].retry_count);
 #endif
-                // Exceeded max retries, drop message
                 queue[i].in_use = false;
             }
         }
@@ -143,10 +141,10 @@ void sf_debug_dump(uint32_t now_ms) {
     for (int i = 0; i < QUEUE_MAX_MESSAGES; ++i) {
         if (queue[i].in_use) {
             uint32_t age_ms = now_ms - queue[i].enqueue_time;
-            DBG_PRINTF("idx: %d | dst: 0x%04X | msg_id: %u | retries: %d | age: %u ms\n",
+            DBG_PRINTF("idx: %d | dst: 0x%04X | msg_id: %08X | retries: %d | age: %u ms\n",
                        i,
                        queue[i].packet.dst_addr,
-                       queue[i].packet.msg_id,
+                       (unsigned int)queue[i].packet.msg_id,
                        queue[i].retry_count,
                        age_ms);
         }

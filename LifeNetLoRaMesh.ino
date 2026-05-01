@@ -109,7 +109,7 @@ static void forwardToLoRa(const std::string& msg) {
   pkt.type        = PACKET_TYPE_DATA;
   pkt.src_addr    = LOCAL_ADDR;
   pkt.dst_addr    = GATEWAY_ADDR;
-  pkt.msg_id      = (uint32_t)random(0xFFFFFFFF);
+  pkt.msg_id = esp_random();
   pkt.ttl         = 5;
   pkt.hop_count   = 0;
   pkt.payload_len = (msg.size() > MAX_PAYLOAD_LEN)
@@ -249,10 +249,10 @@ void setup() {
   uint32_t now = millis();
   routing_add_or_update(
       GATEWAY_ADDR,
-      GATEWAY_ADDR,   // next_hop
+      0x0004,         // Node 2 icin burasi boyle olacak Aracı / Next Hop (NODE 1)
       1,              // hop_count
       0,              // seq_num
-      now + 120000,
+      now + 604800000, // node 
       0,
       ROUTE_VALID
   );
@@ -338,7 +338,7 @@ void loop() {
           } else if (action.type == CTRL_GENERATE_RREP) {
               Packet rrep;
               packet_init(rrep);
-              rrep.msg_id   = (uint32_t)random(0xFFFFFFFF);
+              rrep.msg_id = esp_random();
               rrep.src_addr = LOCAL_ADDR;
               rrep.dst_addr = p.src_addr;
               rrep.prev_hop = LOCAL_ADDR;
@@ -376,7 +376,8 @@ void loop() {
           pkt.type      = PACKET_TYPE_DATA;
           pkt.src_addr  = LOCAL_ADDR;
           pkt.dst_addr  = GATEWAY_ADDR;
-          pkt.msg_id    = (uint32_t)random(0xFFFFFFFF);
+          pkt.msg_id = esp_random();
+          pkt.ttl       = 7;
           const char* msg = "HELLO";
           pkt.payload_len = 5;
           for (int i = 0; i < 5; i++) pkt.payload[i] = msg[i];

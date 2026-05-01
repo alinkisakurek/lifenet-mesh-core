@@ -7,6 +7,7 @@ struct StoredMessage {
     uint32_t enqueue_time;  // ms since boot
     uint8_t  retry_count;   // how many times forwarding has been attempted
     bool     in_use;
+    uint32_t last_attempt_time;  // <--- BU SATIRI EKLE
 };
 
 // V1 queue parameters
